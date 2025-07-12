@@ -3,6 +3,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Event = require("ui/event")
+local HTTPClient = require("httpclient")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local ProgressWidget = require("ui/widget/progresswidget")
 local ReaderPanning = require("apps/reader/modules/readerpanning")
@@ -82,6 +83,7 @@ local ReaderRolling = InputContainer:extend{
     mark_func = nil,
     unmark_func = nil,
     _stepRerenderingAutomation = nil,
+    _position_update_timer = nil,
 }
 
 function ReaderRolling:init()
@@ -279,6 +281,10 @@ function ReaderRolling:onCloseDocument()
     end
     if self.unmark_func then
         UIManager:unschedule(self.unmark_func)
+    end
+    if self._position_update_timer then
+        UIManager:unschedule(self._position_update_timer)
+        self._position_update_timer = nil
     end
     UIManager:unschedule(self.onCheckDomStyleCoherence)
     UIManager:unschedule(self.onUpdatePos)
@@ -498,6 +504,51 @@ To get back to a sane state, a full rendering will happen in the background, get
             })
         end,
     }
+    menu_items.position_sync = {
+        text = _("Position sync API"),
+        callback = function()
+            local InputDialog = require("ui/widget/inputdialog")
+            local current_url = G_reader_settings:readSetting("position_sync_api_url") or ""
+            local input_dialog = InputDialog:new{
+                title = _("Position sync API URL"),
+                input = current_url,
+                hint = _("Enter API endpoint URL (e.g., http://localhost:8080/api/position)"),
+                buttons = {
+                    {
+                        {
+                            text = _("Cancel"),
+                            id = "close",
+                            callback = function()
+                                UIManager:close(input_dialog)
+                            end,
+                        },
+                        {
+                            text = _("Save"),
+                            callback = function()
+                                local new_url = input_dialog:getInputText()
+                                if new_url and new_url ~= "" then
+                                    G_reader_settings:saveSetting("position_sync_api_url", new_url)
+                                else
+                                    G_reader_settings:delSetting("position_sync_api_url")
+                                end
+                                UIManager:close(input_dialog)
+                            end,
+                        },
+                    },
+                },
+            }
+            UIManager:show(input_dialog)
+        end,
+        hold_callback = function()
+            UIManager:show(ConfirmBox:new{
+                text = _("Clear position sync API URL setting?"),
+                ok_callback = function()
+                    G_reader_settings:delSetting("position_sync_api_url")
+                end,
+            })
+        end,
+        help_text = _("Configure API endpoint for syncing reading position. When set, KOReader will send PUT requests with XPointer position and book hash whenever you turn pages."),
+    }
 end
 
 function ReaderRolling:getLastPercent()
@@ -689,11 +740,13 @@ end
 function ReaderRolling:onPosUpdate(new_pos)
     self.current_pos = new_pos
     self:updateBatteryState()
+    self:sendPositionUpdate()
 end
 
 function ReaderRolling:onPageUpdate(new_page)
     self.current_page = new_page
     self:updateBatteryState()
+    self:sendPositionUpdate()
 end
 
 function ReaderRolling:onResume()
@@ -1287,6 +1340,82 @@ function ReaderRolling:updateBatteryState()
         return state
     end
     return 0
+end
+
+function ReaderRolling:sendPositionUpdate()
+    -- Send API PUT request with XPointer position and book hash
+    if not self.ui.document or not self.xpointer then
+        logger.dbg("ReaderRolling: Cannot send position update - missing document or xpointer")
+        return
+    end
+    
+    -- Check if API endpoint is configured
+    local api_url = G_reader_settings:readSetting("position_sync_api_url")
+    if not api_url or api_url == "" then
+        logger.dbg("ReaderRolling: Position sync API URL not configured")
+        return
+    end
+    
+    -- Cancel any previous pending position update
+    if self._position_update_timer then
+        UIManager:unschedule(self._position_update_timer)
+        self._position_update_timer = nil
+    end
+    
+    -- Schedule the actual update with a small delay to debounce rapid page turns
+    self._position_update_timer = function()
+        self._position_update_timer = nil
+        self:_sendPositionUpdateNow()
+    end
+    UIManager:scheduleIn(0.5, self._position_update_timer)
+end
+
+function ReaderRolling:_sendPositionUpdateNow()
+    -- Internal function that actually sends the API request
+    if not self.ui.document or not self.xpointer then
+        logger.dbg("ReaderRolling: Cannot send position update - document or xpointer unavailable")
+        return
+    end
+    
+    local api_url = G_reader_settings:readSetting("position_sync_api_url")
+    if not api_url or api_url == "" then
+        return  -- API not configured
+    end
+    
+    local book_hash = self.ui.document:getDocumentRenderingHash(false)
+    local xpointer = self.xpointer
+    
+    -- Escape quotes in the data for JSON
+    local escaped_xpointer = string.gsub(xpointer or "", '"', '\\"')
+    local escaped_book_hash = string.gsub(book_hash or "", '"', '\\"')
+    
+    -- Create JSON payload
+    local json_data = string.format('{"xpointer": "%s", "book_hash": "%s"}', 
+                                   escaped_xpointer, escaped_book_hash)
+    
+    local request = {
+        url = api_url,
+        method = "PUT",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = tostring(#json_data)
+        },
+        body = json_data
+    }
+    
+    local http_client = HTTPClient:new()
+    http_client:request(request, function(response)
+        if response and response.code then
+            if response.code == 200 or response.code == 201 or response.code == 204 then
+                logger.dbg("ReaderRolling: Position update sent successfully, response code:", response.code)
+            else
+                logger.warn("ReaderRolling: Position update failed with response code:", response.code, 
+                           response.body and ("body: " .. tostring(response.body)) or "")
+            end
+        else
+            logger.warn("ReaderRolling: Position update failed - no response received")
+        end
+    end)
 end
 
 function ReaderRolling:handleEngineCallback(ev, ...)
